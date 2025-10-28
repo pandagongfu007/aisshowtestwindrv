@@ -23,11 +23,78 @@
 
 #include "Lib/CHR44X02_lib.h"  // ← 按你的实际路径调整
 
+// 防止与 34XXX 头文件中的 DLL 宏冲突
+#ifdef DLL
+#undef DLL
+#endif
+
+#include "Lib/CHR34XXX_lib.h"
+
+/*
+
+离散卡：
+
+di open 0
+di reset
+di get 0
+do set 0 1
+trig mode 2
+trig line 3
+trig in cfg 3 3
+trig in wait 1000
+
+串口卡：
+
+ser open 0
+ser rs 0 232
+ser comm 0 115200 8 n 1
+ser tx 0  48 65 6C 6C 6F 0D 0A
+ser rx 0  64
+
+快速冒烟测试
+
+快速冒烟测试（两类卡各跑一遍）
+
+离散卡（44X02）
+
+di open 0
+
+di get 0
+
+do set 0 1 → do set 0 0
+
+trig mode 2 → trig line 3
+
+trig in cfg 3 3 → trig in open → trig in wait 1000
+
+di close
+
+串口卡（34XXX）
+
+ser open 0
+
+ser rs 0 232
+
+ser comm 0 115200 8 n 1
+
+ser tx 0 48 65 6C 6C 6F 0D 0A（发送 “Hello\r\n”）
+
+ser rx 0 64
+
+ser close
+
+
+*/
+
+
 // ===================== 全局状态（设备 / 触发） =====================
 static HANDLE gDev        = nullptr;  // di open 后保存
 static HANDLE gTrigEvent  = nullptr;  // trig in open/create 后保存
 static BYTE   gWorkMode   = 0;        // 0=单板, 1=主卡, 2=从卡
 static BYTE   gTrigLine   = 0;        // 0..7 (PXI_TRIG0..7)
+
+static int   gSerDevId = -1; // 34XXX 设备编号
+
 
 // ===================== 控制台UI全局 =====================
 static const wchar_t* kWndClass   = L"PcieShellWnd";
@@ -73,9 +140,12 @@ static std::wstring ToLower(std::wstring s) {
 static void ConsoleAppend(std::wstring_view text) {
     if (!g_hConsole) return;
     int len = GetWindowTextLengthW(g_hConsole);
-    SendMessageW(g_hConsole, EM_SETSEL, (WPARAM)len, (LPARAM)len);
-    SendMessageW(g_hConsole, EM_REPLACESEL, FALSE, (LPARAM)text.data());
+    SendMessageW(g_hConsole, EM_SETSEL, len, len);
+    std::wstring tmp(text);                      // ← 保证 \0 结尾
+    SendMessageW(g_hConsole, EM_REPLACESEL, FALSE, (LPARAM)tmp.c_str());
 }
+
+
 
 static void ConsoleNewPrompt() {
     ConsoleAppend(g_prompt);
@@ -86,13 +156,19 @@ static void ConsoleNewPrompt() {
 
 static std::wstring ConsoleGetCurrentLine() {
     int totalLen = GetWindowTextLengthW(g_hConsole);
-    std::wstring buf; buf.resize((size_t)totalLen);
-    GetWindowTextW(g_hConsole, buf.data(), totalLen + 1);
-    if (g_inputStart > (size_t)totalLen) return L"";
+    if (totalLen < 0) totalLen = 0;
+    std::wstring buf;
+    buf.resize((size_t)totalLen + 1);                           // +1 留给 \0
+    int got = GetWindowTextW(g_hConsole, buf.data(), totalLen + 1);
+    if (got < 0) got = 0;
+    buf.resize((size_t)got);                                    // 去掉 \0
+
+    if (g_inputStart > (size_t)got) return L"";
     std::wstring sub = buf.substr(g_inputStart);
     while (!sub.empty() && (sub.back() == L'\r' || sub.back() == L'\n')) sub.pop_back();
     return sub;
 }
+
 
 // ===================== 执行日志（UTF-8 文件） =====================
 static std::wstring GetLogPath() {
@@ -139,38 +215,47 @@ static void LogCmdResult(const std::wstring& cmd, const std::wstring& result) {
 // ===================== help 文案 =====================
 static std::wstring HelpText() {
     return
-L"命令列表：\r\n"
-L"\r\n"
-L"[设备]\r\n"
-L"  di open <cardId>        打开设备（cardId通常从0开始）\r\n"
-L"  di reset                复位当前设备\r\n"
-L"  di close                关闭设备（内部会先复位）\r\n"
-L"\r\n"
-L"[输入]\r\n"
-L"  di get <ch>             读取单通道 DI（0..23）\r\n"
-L"  di poll [ms]            轮询 24 路 DI 一次（可在脚本中循环调用）\r\n"
-L"\r\n"
-L"[输出]\r\n"
-L"  do set <ch> <0|1>       设置单通道 DO（0..23）\r\n"
-L"  do all <hexMask>        批量写 24 路（bit0→ch0 ... bit23→ch23）\r\n"
-L"  do wave odd-even        演示：偶数=0、奇数=1（demo_0）\r\n"
-L"\r\n"
-L"[触发 / PXIe]\r\n"
-L"  trig mode <0|1|2>       工作模式：0单板/1主卡/2从卡（PXIe常用2）\r\n"
-L"  trig line <0..7>        选择 PXI_TRIG 线（0..7 对应 PXI_TRIG0..7）\r\n"
-L"  trig in cfg <line> <edge> 配置触发输入：line=0..7, edge=参见头文件枚举\r\n"
-L"  trig in open            显式创建触发事件句柄（可选）\r\n"
-L"  trig in wait <timeout>  等待触发 <timeout_ms> 并读取状态\r\n"
-L"  trig in close           关闭触发事件句柄\r\n"
-L"\r\n"
-L"[演示]\r\n"
-L"  demo do                 执行 DO 奇偶演示（odd=1, even=0）\r\n"
-L"  demo di                 一次性读取并打印 24 路 DI\r\n"
-L"\r\n"
-L"[其它]\r\n"
-L"  help                    显示本帮助\r\n"
-L"\r\n";
+        L"[串口卡 CHR34XXX]\r\n"
+        L"  ser open <id>            打开\r\n"
+        L"  ser close                关闭\r\n"
+        L"  ser rs <ch> 232|422|485  设置电气模式\r\n"
+        L"  ser comm <ch> <baud> <data 5-8> <parity n|o|e|m|s> <stop 1|15|2>\r\n"
+        L"  ser tx <ch> <hex...>     发送十六进制字节\r\n"
+        L"  ser rx <ch> <n>          读取 n 字节\r\n"
+        L"  ser preset async <ch> <baud> [232|422|485] [8 n 1]\r\n"
+        L"\r\n"
+        L"[离散卡 CHR44X02设备]\r\n"
+        L"  di open <cardId>        打开设备（cardId通常从0开始）\r\n"
+        L"  di reset                复位当前设备\r\n"
+        L"  di close                关闭设备（内部会先复位）\r\n"
+        L"\r\n"
+        L"[输入]\r\n"
+        L"  di get <ch>             读取单通道 DI（0..23）\r\n"
+        L"  di poll [ms]            轮询 24 路 DI 一次（可在脚本中循环调用）\r\n"
+        L"\r\n"
+        L"[输出]\r\n"
+        L"  do set <ch> <0|1>       设置单通道 DO（0..23）\r\n"
+        L"  do all <hexMask>        批量写 24 路（bit0→ch0 ... bit23→ch23）\r\n"
+        L"  do wave odd-even        演示：偶数=0、奇数=1（demo_0）\r\n"
+        L"\r\n"
+        L"[触发 / PXIe]\r\n"
+        L"  trig mode <0|1|2>       工作模式：0单板/1主卡/2从卡（PXIe常用2）\r\n"
+        L"  trig line <0..7>        选择 PXI_TRIG 线（0..7 对应 PXI_TRIG0..7）\r\n"
+        L"  trig in cfg <line> <edge> 配置触发输入：line=0..7, edge=参见头文件枚举\r\n"
+        L"  trig in open            显式创建触发事件句柄（可选）\r\n"
+        L"  trig in wait <timeout>  等待触发 <timeout_ms> 并读取状态\r\n"
+        L"  trig in close           关闭触发事件句柄\r\n"
+        L"\r\n"
+        L"[演示]\r\n"
+        L"  demo do                 执行 DO 奇偶演示（odd=1, even=0）\r\n"
+        L"  demo di                 一次性读取并打印 24 路 DI\r\n"
+        L"\r\n"
+        L"[其它]\r\n"
+        L"  help                    显示本帮助\r\n"
+        L"\r\n";
 }
+
+
 
 // ===================== CHR 命令执行器（核心） =====================
 static std::wstring ExecuteChrCmd(const std::wstring& line) {
@@ -185,6 +270,111 @@ static std::wstring ExecuteChrCmd(const std::wstring& line) {
     if (eq(tok[0], L"help")) {
         return HelpText();
     }
+
+
+// 串口输入
+
+	// ---- ser: 串口卡 CHR34XXX ----
+	if (eq(tok[0], L"ser")) {
+		auto w2i = [](const std::wstring& s){ return _wtoi(s.c_str()); };
+	
+		if (tok.size()>=2 && eq(tok[1], L"open")) {
+			if (tok.size()<3) return L"[err] usage: ser open <devId>\r\n";
+			int id = w2i(tok[2]);
+			if (gSerDevId >= 0) { CHR34XXX_StopDevice(gSerDevId); gSerDevId = -1; }
+			if (CHR34XXX_StartDevice(id) != TRUE) return L"[err] CHR34XXX_StartDevice fail\r\n";
+			gSerDevId = id;
+			return std::format(L"[ok] ser open {}\r\n", id);
+		}
+		if (tok.size()>=2 && eq(tok[1], L"close")) {
+			if (gSerDevId >= 0) { CHR34XXX_StopDevice(gSerDevId); gSerDevId=-1; }
+			return L"[ok] ser close\r\n";
+		}
+		if (gSerDevId < 0) return L"[err] ser device not open\r\n";
+	
+		// 电气模式：232/422/485
+		if (tok.size()>=4 && eq(tok[1], L"rs")) {
+			int ch = w2i(tok[2]);
+			int mode = (tok[3]==L"232"?0:(tok[3]==L"422"?1:2));
+			if (CHR34XXX_Ch_SetRsMode(gSerDevId, (BYTE)ch, (BYTE)mode, TRUE) != TRUE)
+				return L"[err] SetRsMode fail\r\n";
+			return std::format(L"[ok] ch{} RS{}\r\n", ch, mode==0?232:(mode==1?422:485));
+		}
+	
+		// 串口参数：comm <ch> <baud> <data 5-8> <parity n|o|e|m|s> <stop 1|15|2>
+		if (tok.size()>=7 && eq(tok[1], L"comm")) {
+			int ch = w2i(tok[2]);
+			CHRUART_DCB_ST d{};
+			d.BaudRate = (DWORD)w2i(tok[3]);
+			d.ByteSize = (BYTE)w2i(tok[4]);
+			wchar_t p = (wchar_t)towlower(tok[5][0]);
+			d.Parity   = (p==L'n'?0:p==L'o'?1:p==L'e'?2:p==L'm'?3:4);
+			int stop   = w2i(tok[6]);				  // 1/15/2 => 1/1.5/2
+			d.StopBits = (stop==15?1:stop==2?2:0);	  // SDK 定义：0:1, 1:1.5, 2:2
+	
+			if (CHR34XXX_Ch_SetCommState(gSerDevId, (BYTE)ch, &d) != TRUE)
+				return L"[err] SetComm fail\r\n";
+	
+			return std::format(L"[ok] ch{} baud={} data={} parity={} stop={}\r\n",
+							   ch, d.BaudRate, d.ByteSize, p, (stop==15?1.5:stop));
+		}
+	
+		// 发送：tx <ch> <hex ...>
+		if (tok.size()>=4 && eq(tok[1], L"tx")) {
+			int ch = w2i(tok[2]);
+			std::vector<BYTE> buf;
+			for (size_t i=3;i<tok.size();++i) {
+				unsigned v = 0;
+				if (swscanf_s(tok[i].c_str(), L"%x", &v) != 1 || v > 0xFF)
+				    return std::format(L"[err] bad hex: {}\r\n", tok[i]);
+				buf.push_back((BYTE)v); 
+			}
+			DWORD w=0;
+			if (CHR34XXX_Ch_WriteFile(gSerDevId, (BYTE)ch, (DWORD)buf.size(), buf.data(), &w) != TRUE)
+				return L"[err] write fail\r\n";
+			return std::format(L"[ok] tx {}B\r\n", w);
+		}
+	
+		// 接收：rx <ch> <n>
+		if (tok.size()>=4 && eq(tok[1], L"rx")) {
+			int ch = w2i(tok[2]); DWORD want = (DWORD)w2i(tok[3]);
+			std::vector<BYTE> buf; buf.resize(want);
+			DWORD r=0;
+			if (CHR34XXX_Ch_ReadFile(gSerDevId, (BYTE)ch, want, buf.data(), &r) != TRUE)
+				return L"[err] read fail\r\n";
+			buf.resize(r);
+	
+			// 复用你已有的十六进制打印函数/或简单打印：
+			std::wstring out = std::format(L"[rx ch{}={}B]\r\n", ch, r);
+			for (DWORD i=0;i<r;i++) {
+				if (i && (i%16==0)) out.append(L"\r\n");
+				out.append(std::format(L"{:02X} ", buf[i]));
+			}
+			out.append(L"\r\n");
+			return out;
+		}
+	
+		// 快速预置：preset async <ch> <baud> [232|422|485] [8 n 1]
+		if (tok.size()>=4 && eq(tok[1], L"preset") && eq(tok[2], L"async")) {
+			int ch = w2i(tok[3]); unsigned baud = (tok.size()>=5)?(unsigned)w2i(tok[4]):115200;
+			int mode=0; if (tok.size()>=6){ if (tok[5]==L"422") mode=1; else if(tok[5]==L"485") mode=2; }
+			CHR34XXX_Ch_SetRsMode(gSerDevId,(BYTE)ch,(BYTE)mode,TRUE);
+	
+			CHRUART_DCB_ST d{}; d.BaudRate=baud; d.ByteSize=8; d.Parity=0; d.StopBits=0;
+			if (tok.size()>=9) {
+				d.ByteSize=(BYTE)w2i(tok[6]); wchar_t p=(wchar_t)towlower(tok[7][0]);
+				d.Parity  =(p==L'n'?0:p==L'o'?1:p==L'e'?2:p==L'm'?3:4);
+				int stop=w2i(tok[8]); d.StopBits=(stop==15?1:stop==2?2:0);
+			}
+			if (CHR34XXX_Ch_SetCommState(gSerDevId,(BYTE)ch,&d)!=TRUE) return L"[err] SetComm fail\r\n";
+			return std::format(L"[ok] ch{} async baud={} RS{}\r\n", ch, baud, mode==0?232:(mode==1?422:485));
+		}
+	
+		return L"[err] ser cmds: open|close|rs|comm|tx|rx|preset async\r\n";
+	}
+
+
+	
 
     // ---- di: 设备生命周期 & 输入 ----
     if (eq(tok[0], L"di")) {
@@ -236,7 +426,10 @@ static std::wstring ExecuteChrCmd(const std::wstring& line) {
                 BYTE st=0; CHR44X02_IO_GetInputStatus(gDev, (BYTE)ch, &st);
                 out.append(std::format(L"ch[{:02}]={} ", ch, st));
             }
-            out.append(L"\r\n");
+			
+			out.append(std::format(L"\r\n(delay {}ms)\r\n", ms));
+			Sleep(ms);				  
+              
             return out;
         }
         return L"[err] di cmds: open|reset|close|get|poll\r\n";
@@ -490,7 +683,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_DESTROY:
         if (g_hBrushBk) { DeleteObject(g_hBrushBk); g_hBrushBk=nullptr; }
         if (g_hFont)    { DeleteObject(g_hFont);    g_hFont=nullptr;   }
-        // 程序退出前，确保资源清理
+		
+ 		if (gSerDevId >= 0) { CHR34XXX_StopDevice(gSerDevId); gSerDevId = -1; }
+		
+         // 程序退出前，确保资源清理
         if (gDev) {
             if (gTrigEvent) { CHR44X02_TrigIn_CloseEvent(gDev, gTrigEvent); gTrigEvent=nullptr; }
             CHR44X02_ResetDev(gDev);

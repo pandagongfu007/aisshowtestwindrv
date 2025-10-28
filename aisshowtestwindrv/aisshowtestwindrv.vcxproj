@@ -111,11 +111,12 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>E:\2025fanmai\code\aishowtest\aishowtestwindrv\aisshowtestwindrv\aisshowtestwindrv\Lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>CHR44X02.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>CHR44X02.lib;CHR34XXX.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <Command>if not exist "$(TargetDir)" mkdir "$(TargetDir)"
-xcopy /Y /D "$(ProjectDir)Lib\CHR44X02.dll" "$(TargetDir)"</Command>
+xcopy /Y /D "$(ProjectDir)Lib\CHR44X02.dll" "$(TargetDir)"
+xcopy /Y /D "$(ProjectDir)Lib\CHR34XXX.dll" "$(TargetDir)"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
