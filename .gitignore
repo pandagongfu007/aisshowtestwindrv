@@ -30,3 +30,11 @@ ipch/
 bin/
 out/
 .vscode/
+.vs/
+x64/
+*.pdb
+*.ipch
+*.db
+*.db-shm
+*.db-wal
+Browse.VC.*
