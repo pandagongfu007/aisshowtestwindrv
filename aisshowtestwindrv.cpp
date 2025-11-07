@@ -6,6 +6,22 @@
 #define NOMINMAX
 #endif
 
+// 加一个模拟开关宏（默认 0）
+#ifndef PCIE_SHELL_SIM
+#define PCIE_SHELL_SIM 0
+#endif
+
+// 在模拟模式下，把 DLL 宏干掉（避免 __declspec(dllimport)）
+#if PCIE_SHELL_SIM
+#  ifdef DLL
+#    undef DLL
+#  endif
+#  define DLL
+#endif
+
+
+
+
 #include <windows.h>
 #include <windowsx.h>
 #include <strsafe.h>
@@ -24,12 +40,96 @@
 #include "Lib/CHR44X02_lib.h"  // ← 按你的实际路径调整
 
 // 防止与 34XXX 头文件中的 DLL 宏冲突
-#ifdef DLL
-#undef DLL
-#endif
 
 #include "Lib/CHR34XXX_lib.h"
 
+
+#if PCIE_SHELL_SIM
+
+// 固定的“假句柄”
+static HANDLE g_simDev      = (HANDLE)0x44440001;
+static HANDLE g_simTrigEvt  = (HANDLE)0x44440002;
+
+// 24 路 DO 的虚拟状态
+static BYTE g_sim_do[24] = {0};
+
+extern "C" {
+
+// ===== 44X02 模拟 =====
+int  __stdcall CHR44X02_OpenDev(HANDLE* phDev, BYTE cardId) {
+    (void)cardId;
+    if (phDev) *phDev = g_simDev;
+    return 0;
+}
+int  __stdcall CHR44X02_CloseDev(HANDLE hDev)      { (void)hDev; return 0; }
+int  __stdcall CHR44X02_ResetDev(HANDLE hDev)      { (void)hDev; return 0; }
+
+int  __stdcall CHR44X02_IO_GetInputStatus(HANDLE hDev, BYTE ch, BYTE* st) {
+    (void)hDev;
+    if (!st || ch >= 24) return -1;
+    // 简单：DI = DO，方便上层验证
+    *st = g_sim_do[ch];
+    return 0;
+}
+int  __stdcall CHR44X02_IO_SetOutputStatus(HANDLE hDev, BYTE ch, BYTE v) {
+    (void)hDev;
+    if (ch >= 24) return -1;
+    g_sim_do[ch] = (BYTE)(v ? 1 : 0);
+    return 0;
+}
+
+int  __stdcall CHR44X02_SetWorkMode(HANDLE hDev, BYTE mode) {
+    (void)hDev; (void)mode; return 0;
+}
+int  __stdcall CHR44X02_SetTrigLine(HANDLE hDev, BYTE line) {
+    (void)hDev; (void)line; return 0;
+}
+int  __stdcall CHR44X02_TrigIn_Config(HANDLE hDev, BYTE line, BYTE edge) {
+    (void)hDev; (void)line; (void)edge; return 0;
+}
+int  __stdcall CHR44X02_TrigIn_CreateEvent(HANDLE hDev, HANDLE* pEvt) {
+    (void)hDev;
+    if (pEvt) *pEvt = g_simTrigEvt;
+    return 0;
+}
+DWORD __stdcall CHR44X02_TrigIn_WaitEvent(HANDLE hDev, HANDLE hEvt, DWORD timeoutMs) {
+    (void)hDev; (void)hEvt; (void)timeoutMs;
+    // 固定：一直超时
+    return 0;
+}
+int  __stdcall CHR44X02_TrigIn_GetStatus(HANDLE hDev, BYTE* st) {
+    (void)hDev;
+    if (st) *st = 0;
+    return 0;
+}
+int  __stdcall CHR44X02_TrigIn_CloseEvent(HANDLE hDev, HANDLE hEvt) {
+    (void)hDev; (void)hEvt; return 0;
+}
+
+// ===== 34XXX 串口模拟（固定成功，不真正收发）=====
+BOOL __stdcall CHR34XXX_StartDevice(int devId)  { (void)devId; return TRUE; }
+BOOL __stdcall CHR34XXX_StopDevice(int devId)   { (void)devId; return TRUE; }
+BOOL __stdcall CHR34XXX_Ch_SetRsMode(int devId, BYTE ch, BYTE mode, BOOL autoRts) {
+    (void)devId; (void)ch; (void)mode; (void)autoRts; return TRUE;
+}
+BOOL __stdcall CHR34XXX_Ch_SetCommState(int devId, BYTE ch, CHRUART_DCB_ST* dcb) {
+    (void)devId; (void)ch; (void)dcb; return TRUE;
+}
+BOOL __stdcall CHR34XXX_Ch_WriteFile(int devId, BYTE ch, DWORD n, BYTE* buf, DWORD* wrote) {
+    (void)devId; (void)ch; (void)buf;
+    if (wrote) *wrote = n;
+    return TRUE;
+}
+BOOL __stdcall CHR34XXX_Ch_ReadFile(int devId, BYTE ch, DWORD n, BYTE* buf, DWORD* read) {
+    (void)devId; (void)ch;
+    if (read) *read = 0;   // 固定读不到数据
+    if (buf && n>0) buf[0] = 0;
+    return TRUE;
+}
+
+} // extern "C"
+
+#endif // PCIE_SHELL_SIM
 
 
 /*
@@ -667,6 +767,15 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         // 欢迎信息 + 帮助提示
         ConsoleAppend(L"PCIe Shell\r\n输入 help 查看命令。\r\n\r\n");
+
+		#ifdef PCIE_SHELL_SIM
+			ConsoleAppend(L"[SIM] Release 模拟模式：不依赖驱动库，返回固定数据\r\n\r\n");
+		#else
+			ConsoleAppend(L"[DRV] 实机模式：使用 CHR 驱动库\r\n\r\n");
+		#endif
+
+
+		
         ConsoleNewPrompt();
         return 0;
     }
